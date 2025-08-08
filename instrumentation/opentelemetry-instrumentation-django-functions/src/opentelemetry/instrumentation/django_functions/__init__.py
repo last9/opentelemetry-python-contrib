@@ -273,6 +273,11 @@ class DjangoFunctionsInstrumentor(BaseInstrumentor):
         try:
             from django.apps import apps
             
+            # Ensure all apps are ready
+            if not apps.ready:
+                _logger.debug("Django apps not ready, deferring view instrumentation")
+                return
+            
             for app_config in apps.get_app_configs():
                 app_name = app_config.name
                 
@@ -282,26 +287,80 @@ class DjangoFunctionsInstrumentor(BaseInstrumentor):
                 try:
                     # Try to import views module from each app
                     views_module_name = f"{app_name}.views"
-                    views_module = importlib.import_module(views_module_name)
+                    
+                    # Check if module is already imported
+                    if views_module_name in sys.modules:
+                        views_module = sys.modules[views_module_name]
+                    else:
+                        # Try to import, but don't fail if it doesn't exist
+                        try:
+                            views_module = importlib.import_module(views_module_name)
+                        except ImportError:
+                            continue
                     
                     # Find view functions and classes
                     for name in dir(views_module):
-                        obj = getattr(views_module, name)
-                        if self._is_view_function(obj) or self._is_view_class(obj):
-                            self._wrap_function(
-                                views_module_name,
-                                name,
-                                f"django.app_view.{app_name}.{name}"
-                            )
+                        if name.startswith('_'):
+                            continue
                             
-                except ImportError:
-                    # App doesn't have a views module, skip
-                    continue
+                        try:
+                            obj = getattr(views_module, name)
+                            if self._is_view_function(obj) or self._is_view_class(obj):
+                                self._wrap_function(
+                                    views_module_name,
+                                    name,
+                                    f"django.app_view.{app_name}.{name}"
+                                )
+                        except Exception as e:
+                            _logger.debug(f"Failed to instrument {name} in {views_module_name}: {e}")
+                            
                 except Exception as e:
-                    _logger.debug(f"Failed to instrument views in app {app_name}: {e}")
+                    _logger.debug(f"Failed to process app {app_name}: {e}")
                     
         except Exception as e:
             _logger.debug(f"Failed to instrument app views: {e}")
+            
+        # Also try to instrument URL-discovered views
+        self._instrument_url_views(excluded_modules)
+    
+    def _instrument_url_views(self, excluded_modules: List[str]):
+        """Instrument views discovered through URL patterns"""
+        try:
+            from django.urls import get_resolver
+            from django.urls.resolvers import URLPattern, URLResolver
+            
+            resolver = get_resolver()
+            self._traverse_url_patterns(resolver.url_patterns, excluded_modules)
+            
+        except Exception as e:
+            _logger.debug(f"Failed to instrument URL views: {e}")
+    
+    def _traverse_url_patterns(self, patterns, excluded_modules: List[str]):
+        """Recursively traverse URL patterns to find views"""
+        for pattern in patterns:
+            if isinstance(pattern, URLPattern):
+                # Found a view
+                callback = pattern.callback
+                if callback:
+                    module_name = callback.__module__
+                    function_name = callback.__name__
+                    
+                    if not self._should_exclude_module(module_name, excluded_modules):
+                        try:
+                            self._wrap_function(
+                                module_name,
+                                function_name,
+                                f"django.url_view.{function_name}"
+                            )
+                        except Exception as e:
+                            _logger.debug(f"Failed to instrument URL view {module_name}.{function_name}: {e}")
+                            
+            elif isinstance(pattern, URLResolver):
+                # Recurse into included URLs
+                try:
+                    self._traverse_url_patterns(pattern.url_patterns, excluded_modules)
+                except Exception as e:
+                    _logger.debug(f"Failed to traverse URL resolver: {e}")
 
     def _is_view_function(self, obj) -> bool:
         """Check if object is a Django view function"""
